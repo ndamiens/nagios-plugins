@@ -2,7 +2,7 @@
 <?php
 
 /**
- * check_chassis_brocade.php - Nagios plugin
+ * check_chassis_extreme.php - Nagios plugin
  *
  *
  * This file is part of "barryo / nagios-plugins" - a library of tools and
@@ -10,7 +10,7 @@
  * (http://www.barryodonovan.com/) and his company, Open Solutions
  * (http://www.opensolutions.ie/).
  *
- * Copyright (c) 2004 - 2013, Open Source Solutions Limited, Dublin, Ireland
+ * Copyright (c) 2004 - 2014, Open Source Solutions Limited, Dublin, Ireland
  * All rights reserved.
  *
  * Contact: Barry O'Donovan - info (at) opensolutions (dot) ie
@@ -44,11 +44,10 @@
  * OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  * @package    barryo / nagios-plugins
- * @copyright  Copyright (c) 2004 - 2013, Open Source Solutions Limited, Dublin, Ireland
+ * @copyright  Copyright (c) 2004 - 2014, Open Source Solutions Limited, Dublin, Ireland
  * @license    http://www.opensolutions.ie/licenses/new-bsd New BSD License
  * @link       http://www.opensolutions.ie/ Open Source Solutions Limited
  * @author     Barry O'Donovan <info@opensolutions.ie>
- * @author     The Skilled Team of PHP Developers at Open Solutions <info@opensolutions.ie>
  */
 
 date_default_timezone_set('Europe/Dublin');
@@ -86,10 +85,10 @@ $cmdargs = [
     'log_level'          => LOG__NONE,
     'memwarn'            => 80,
     'memcrit'            => 90,
+    'tempwarn'           => 55,
+    'tempcrit'           => 65,
     'reboot'             => 3600,
-    'thres-cpu-1sec'     => '95,98',
-    'thres-cpu-5sec'     => '85,95',
-    'thres-cpu-1min'     => '70,90'
+    'thres-cpu'          => '85,95',
 ];
 
 
@@ -109,7 +108,6 @@ checkPower();
 checkFans();
 checkTemperature();
 checkMemory();
-checkOthers();
 
 
 if( $status == STATUS_OK )
@@ -137,30 +135,23 @@ function checkTemperature()
 
     try
     {
-        // remember - Foundry use units of 0.5 Celcius:
-        $temp = $snmp->useFoundry_Chassis()->actualTemperature() / 2.0;
-        $warn = $snmp->useFoundry_Chassis()->warningTemperature() / 2.0;
-        $shut = $snmp->useFoundry_Chassis()->shutdownTemperature() / 2.0;
-
-        if( !$warn ) $warn = 64.0;
-    }
-    catch( OSS_SNMP\Exception $e )
-    {
-       /* Temp not supported
+        $temp = $snmp->useExtreme_System_Common()->currentTemperature();
+        $over = $snmp->useExtreme_System_Common()->overTemperatureAlarm();
+    } catch( OSS_SNMP\Exception $e ) {
         setStatus( STATUS_UNKNOWN );
         $unknowns .= "Temperature unknown - possibly not supported on platform? Use --skip-temp. ";
         _log( "WARNING: Temperature unknown - possibly not supported on platform? Use --skip-temp.\n", LOG__ERROR );
-        */
         return;
     }
 
-    _log( "Temp: $temp (Warn: $warn Shutdown: $shut)", LOG__VERBOSE );
-    $tempdata = sprintf( "Temp (A/W/C):  %0.1f/%0.1f/%0.1f", $temp, $warn, $shut );
+    _log( "Temp: {$temp}'C", LOG__VERBOSE );
+    _log( "Over temp alert: " . ( $over ? 'YES' : 'NO' ), LOG__VERBOSE );
 
-    if( $temp >= $warn )
-    {
+    $tempdata = sprintf( "Temp: %d'C", $temp );
+
+    if( $over ) {
         setStatus( STATUS_CRITICAL );
-        $criticals .= "Temperature approaching SHUTDOWN threshold: $temp/$shut";
+        $criticals .= "Temperature alarm set: {$temp}'C. ";
     }
 
     if( isset( $cmdargs['tempcrit'] ) && $cmdargs['tempcrit'] && $temp >= $cmdargs['tempcrit'] )
@@ -191,11 +182,10 @@ function checkFans()
 
     try
     {
-        $fanDescs  = $snmp->useFoundry_Chassis()->fanDescriptions();
-        $fanStates = $snmp->useFoundry_Chassis()->fanStates();
-    }
-    catch( OSS_SNMP\Exception $e )
-    {
+        $fans   = $snmp->useExtreme_System_Common()->fanOperational();
+        $speeds = $snmp->useExtreme_System_Common()->fanSpeed();
+
+    } catch( OSS_SNMP\Exception $e ) {
         setStatus( STATUS_UNKNOWN );
         $unknowns .= "Fan states unknown - possibly not supported on platform? Use --skip-fans. ";
         _log( "WARNING: Fan states unknown - possibly not supported on platform? Use --skip-fans.\n", LOG__ERROR );
@@ -204,20 +194,21 @@ function checkFans()
 
     $fandata = 'Fans:';
 
-    foreach( $fanStates as $i => $state )
+    foreach( $fans as $i => $operational )
     {
-        _log( "Fan: {$fanDescs[$i]} - $state", LOG__VERBOSE );
-        $fandata .= $state == OSS_SNMP\MIBS\Foundry\Chassis::FAN_STATE_NORMAL ? ' OK' : " " . strtoupper( $state );
+        $ok = $operational && $speeds[$i] >= 2000;
+        
+        _log( "Fan: {$i} - " . ( $ok ? 'OK' : 'NOT OK' ) . " ({$speeds[$i]} RPM)", LOG__VERBOSE );
+        $fandata .= " [{$i} - " . ( $ok ? 'OK' : 'NOT OK' ) . " ({$speeds[$i]} RPM)];";
 
-        if( $state == OSS_SNMP\MIBS\Foundry\Chassis::FAN_STATE_FAILURE )
-        {
+        if( !$ok ) {
             setStatus( STATUS_CRITICAL );
-            $criticals .= "Fan state for {$fanDescs[$i]}: $state";
-        }
-        else if( $state != OSS_SNMP\MIBS\Foundry\Chassis::FAN_STATE_NORMAL )
-        {
-            setStatus( STATUS_WARNING );
-            $criticals .= "Fan state for {$fanDescs[$i]}: $state";
+            if( $operational && $speeds[$i] < 2000 )
+                $criticals .= "Fan {$i} is operational but speed is outside normal operating range (<2000). ";
+            else if( !$operational )
+                $criticals .= "Fan {$i} is not operational. ";
+            else
+                $criticals .= "Fan {$i} is not operational (reason unknown). ";
         }
     }
 
@@ -239,8 +230,15 @@ function checkPower()
 
     try
     {
-        $psuDescs  = $snmp->useFoundry_Chassis()->psuDescriptions();
-        $psuStates = $snmp->useFoundry_Chassis()->psuStates();
+        $psuStates  = $snmp->useExtreme_System_Common()->powerSupplyStatus();
+        $psuSerials = $snmp->useExtreme_System_Common()->powerSupplySerialNumbers();
+        $psuSources = $snmp->useExtreme_System_Common()->powerSupplySource();
+
+        $sources = OSS_SNMP\MIBS\Extreme\System\Common::$POWER_SUPPLY_SOURCES;
+        $states  = OSS_SNMP\MIBS\Extreme\System\Common::$POWER_SUPPLY_STATES;
+
+        $systemPowerState = $snmp->useExtreme_System_Common()->systemPowerState();
+        $systemState      = OSS_SNMP\MIBS\Extreme\System\Common::$POWER_STATES;
     }
     catch( OSS_SNMP\Exception $e )
     {
@@ -254,19 +252,37 @@ function checkPower()
 
     foreach( $psuStates as $i => $state )
     {
-        _log( "PSU: {$psuDescs[$i]} - $state", LOG__VERBOSE );
-        $psudata .= $state == OSS_SNMP\MIBS\Foundry\Chassis::PSU_STATE_NORMAL ? ' OK' : " " . strtoupper( $state );
+        _log( "PSU: {$i} - {$states[$state]} (Serial: {$psuSerials[$i]}; Source: {$sources[ $psuSources[$i] ]})", LOG__VERBOSE );
+        $psudata .= " {$i} - {$states[$state]};";
 
-        if( $state == OSS_SNMP\MIBS\Foundry\Chassis::PSU_STATE_FAILURE )
-        {
-            setStatus( STATUS_CRITICAL );
-            $criticals .= "PSU state for {$psuDescs[$i]}: $state";
-        }
-        else if( $state != OSS_SNMP\MIBS\Foundry\Chassis::PSU_STATE_NORMAL )
+        if( $state == OSS_SNMP\MIBS\Extreme\System\Common::POWER_SUPPLY_STATUS_NOT_PRESENT
+                && !( isset( $cmdargs['ignore-psu-notpresent'] ) && $cmdargs['ignore-psu-notpresent'] ) )
         {
             setStatus( STATUS_WARNING );
-            $criticals .= "PSU state for {$psuDescs[$i]}: $state";
+            $warnings .= "PSU $i is not present";
         }
+        else if( $state != OSS_SNMP\MIBS\Extreme\System\Common::POWER_SUPPLY_STATUS_PRESENT_OK )
+        {
+            setStatus( STATUS_CRITICAL );
+            $criticals .= "PSU state for {$i}: {$states[$state]}";
+        }
+    }
+
+    $psudata .= ". ";
+
+    if( $systemPowerState == OSS_SNMP\MIBS\Extreme\System\Common::SYSTEM_POWER_STATE_REDUNDANT_POWER_AVAILABLE )
+    {
+        $psudata .= "Overall system power state: redundant power available";
+    }
+    else if( $systemPowerState == OSS_SNMP\MIBS\Extreme\System\Common::SYSTEM_POWER_STATE_SUFFICIENT_BUT_NOT_REDUNDANT_POWER )
+    {
+        setStatus( STATUS_WARNING );
+        $warnings .= "Overall system power state: sufficient but not redundant power available";
+    }
+    else if( $systemPowerState == OSS_SNMP\MIBS\Extreme\System\Common::SYSTEM_POWER_STATE_INSUFFICIENT_POWER )
+    {
+        setStatus( STATUS_CRITICAL );
+        $warnings .= "Overall system power state: insufficent power available";
     }
 
     $normals .= " $psudata.";
@@ -285,22 +301,27 @@ function checkMemory()
 
     _log( "========== Memory check start ==========", LOG__DEBUG );
 
-    $memUtil = $snmp->useFoundry_Chassis()->memoryUtilisation();
+    $memUtil = $snmp->useExtreme_SwMonitor_Memory()->percentUsage();
 
-    _log( "Memory used: {$memUtil}%", LOG__VERBOSE );
+    $memData = " Memory (slot:usage%):";
 
-    if( $memUtil > $cmdargs['memcrit'] )
-    {
-        setStatus( STATUS_CRITICAL );
-        $criticals .= "Memory usage at {$memUtil}%. ";
+    foreach( $memUtil as $slotId => $usage ) {
+        _log( "Memory used in slot {$slotId}: {$usage}%", LOG__VERBOSE );
+
+        if( $usage > $cmdargs['memcrit'] )
+        {
+            setStatus( STATUS_CRITICAL );
+            $criticals .= "Memory usage in slot {$slotId} at {$usage}%. ";
+        }
+        else if( $usage > $cmdargs['memwarn'] )
+        {
+            setStatus( STATUS_WARNING );
+            $warningss .= "Memory usage in slot {$slotId} at {$usage}%. ";
+        }
+        else
+            $memData .= " {$slotId}:{$usage}%";
     }
-    else if( $memUtil > $cmdargs['memwarn'] )
-    {
-        setStatus( STATUS_WARNING );
-        $warnings .= "Memory usage at {$memUtil}%. ";
-    }
-    else
-        $normals .= " Memory OK ({$memUtil}%).";
+    $normals .= $memData . '. ';
 
     _log( "========== Memory check end ==========\n", LOG__DEBUG );
 }
@@ -315,24 +336,27 @@ function checkReboot()
 
     _log( "========== Reboot check start ==========", LOG__DEBUG );
 
-    // uptime in seconds
-    $sysuptime = $snmp->useSystem()->uptime() / 100.0;
+    $bootTime  = $snmp->useExtreme_System_Common()->bootTime();
 
-    if( ( isset( $cmdargs['lastcheck'] ) && $cmdargs['lastcheck'] && $sysuptime <= $cmdargs['lastcheck'] )
-            || ( $sysuptime < $cmdargs['reboot'] ) )
+
+    if( ( isset( $cmdargs['lastcheck'] ) && $cmdargs['lastcheck'] && $bootTime <= $cmdargs['lastcheck'] )
+            || ( time() - $bootTime <= $cmdargs['reboot'] ) )
     {
-        // Brocade use a 32bit integer for sysuptime (argh!) so it rolls over every 497.1 days
-        // If we find that the system has rebooted, we'll get a second opinion
-
-        $engineTime = $snmp->useSNMP_Engine()->time();
-
-        if( ( isset( $cmdargs['lastcheck'] ) && $cmdargs['lastcheck'] && $engineTime <= $cmdargs['lastcheck'] )
-                || ( $engineTime < $cmdargs['reboot'] ) )
-        {
-            setStatus( STATUS_CRITICAL );
-            $criticals .= sprintf( "Device rebooted %0.1f minutes ago. ", $sysuptime / 60.0 );
-        }
+        setStatus( STATUS_CRITICAL );
+        $criticals .= sprintf( "Device rebooted %0.1f minutes ago. ", ( time() - $bootTime ) / 60.0 );
     }
+
+    $up = ( time() - $bootTime ) / 60.0 / 60.0;
+
+    if( $up < 24 )
+        $up = sprintf( "Uptime: %0.1f hours. ", $up );
+    else
+        $up = sprintf( "Uptime: %0.1f days. ", $up / 24 );
+
+    _log( "Last reboot: " . ( ( time() - $bootTime ) / 60.0 ) . " minutes ago", LOG__VERBOSE );
+    _log( $up, LOG__VERBOSE );
+
+    $normals .= " {$up}";
 
     _log( "========== Reboot check end ==========", LOG__DEBUG );
 }
@@ -348,119 +372,28 @@ function checkCPU()
 
     _log( "========== CPU check start ==========", LOG__DEBUG );
 
-    $cpudata = 'CPU: ';
+    $util  = $snmp->useExtreme_SwMonitor_Cpu()->totalUtilization();
 
-    foreach( [ '1sec', '5sec', '1min' ] as $period )
+
+    _log( "CPU: 5sec - $util%", LOG__VERBOSE );
+    $cpudata = "CPU: 5sec - {$util}%";
+
+    list( $w, $c ) = explode( ',', $cmdargs["thres-cpu"] );
+
+    if( $util >= $c )
     {
-        if( isset( $cmdargs["skip-cpu-$period"] ) && $cmdargs["skip-cpu-$period"] )
-            continue;
-
-        $fn = "cpu{$period}Utilisation";
-        $util = $snmp->useFoundry_Chassis()->$fn();
-
-        _log( "CPU: $period - $util%", LOG__VERBOSE );
-        $cpudata .= " $period $util%";
-
-        list( $w, $c ) = explode( ',', $cmdargs["thres-cpu-$period"] );
-
-        if( $util >= $c )
-        {
-            setStatus( STATUS_CRITICAL );
-            $criticals .= "CPU $period usage at {$util}%. ";
-        }
-        else if( $util >= $w )
-        {
-            setStatus( STATUS_WARNING );
-            $warnings .= "CPU $period usage at {$util}%. ";
-        }
+        setStatus( STATUS_CRITICAL );
+        $criticals .= "CPU 5sec usage at {$util}%. ";
+    }
+    else if( $util >= $w )
+    {
+        setStatus( STATUS_WARNING );
+        $warnings .= "CPU 5sec usage at {$util}%. ";
     }
 
     $normals .= " $cpudata.";
 }
 
-
-
-function checkOthers()
-{
-    global $snmp, $cmdargs, $periods, $criticals, $warnings, $unknowns, $normals;
-
-    if( isset( $cmdargs['skip-others'] ) && $cmdargs['skip-others'] )
-        return;
-
-    _log( "========== Others check start ==========", LOG__DEBUG );
-
-    try
-    {
-        if( $snmp->useFoundry_Chassis()->isQueueOverflow() )
-        {
-            _log( "Error - queue overflow indicated", LOG__VERBOSE );
-            setStatus( STATUS_CRITICAL );
-            $criticals .= "Queue overflow indicated. ";
-        }
-        else
-            _log( "OK - queue overflow not indicated", LOG__VERBOSE );
-    }
-    catch( \OSS_SNMP\Exception $e )
-    { /* not supported on this platform */ }
-
-    try
-    {
-        if( $snmp->useFoundry_Chassis()->isBufferShortage() )
-        {
-            _log( "Error - buffer shortage indicated", LOG__VERBOSE );
-            setStatus( STATUS_CRITICAL );
-            $criticals .= "Buffer shortage indicated. ";
-        }
-        else
-            _log( "OK - buffer shortage not indicated", LOG__VERBOSE );
-    }
-    catch( \OSS_SNMP\Exception $e )
-    { /* not supported on this platform */ }
-
-    try
-    {
-        if( $snmp->useFoundry_Chassis()->isDMAFailure() )
-        {
-            _log( "Error - DMA failure indicated", LOG__VERBOSE );
-            setStatus( STATUS_CRITICAL );
-            $criticals .= "DMA failure indicated. ";
-        }
-        else
-            _log( "OK - DMA failure not indicated", LOG__VERBOSE );
-    }
-    catch( \OSS_SNMP\Exception $e )
-    { /* not supported on this platform */ }
-
-    try
-    {
-        if( $snmp->useFoundry_Chassis()->isResourceLow() )
-        {
-            _log( "Error - low resources indicated", LOG__VERBOSE );
-            setStatus( STATUS_CRITICAL );
-            $criticals .= "Low resources indicated. ";
-        }
-        else
-            _log( "OK - low resources not indicated", LOG__VERBOSE );
-    }
-    catch( \OSS_SNMP\Exception $e )
-    { /* not supported on this platform */ }
-
-    try
-    {
-        if( $snmp->useFoundry_Chassis()->isExcessiveError() )
-        {
-            _log( "Error - excessive errors indicated", LOG__VERBOSE );
-            setStatus( STATUS_CRITICAL );
-            $criticals .= "Excessive errors indicated. ";
-        }
-        else
-            _log( "OK - excessive errors not indicated", LOG__VERBOSE );
-    }
-    catch( \OSS_SNMP\Exception $e )
-    { /* not supported on this platform */ }
-  
-    _log( "========== Others check end ==========", LOG__DEBUG );
-}
 
 
 /**
@@ -506,16 +439,19 @@ function parseArguments()
                 break;
 
             case 'c':
+                if( !isset( $argv[$i+1] ) ) { printUsage( true ); exit( STATUS_UNKNOWN ); }
                 $cmdargs['community'] = $argv[$i+1];
                 $i++;
                 break;
 
             case 'h':
+                if( !isset( $argv[$i+1] ) ) { printUsage( true ); exit( STATUS_UNKNOWN ); }
                 $cmdargs['host'] = $argv[$i+1];
                 $i++;
                 break;
 
             case 'p':
+                if( !isset( $argv[$i+1] ) ) { printUsage( true ); exit( STATUS_UNKNOWN ); }
                 $cmdargs['port'] = $argv[$i+1];
                 $i++;
                 break;
@@ -616,7 +552,7 @@ LICENSE;
 
 function printHelp()
 {
-    global $argv;
+    global $argv, $cmdargs;
     $progname = basename( $argv[0] );
 
     echo <<<END_USAGE
@@ -644,12 +580,12 @@ Options:
     Debug output
 
   --skip-mem              Skip memory checks
-  --memwarn <integer>     Percentage of memory usage for warning (using: 70)
-  --memcrit <integer>     Percentage of memory usage for critical (using: 90)
+  --memwarn <integer>     Percentage of memory usage for warning (using: {$cmdargs['memwarn']})
+  --memcrit <integer>     Percentage of memory usage for critical (using: {$cmdargs['memcrit']})
 
   --skip-temp             Skip temperature checks
-  --tempwarn <integer>    Degrees Celsius for warning (in addition to device's setting)
-  --tempcrit <integer>    Degrees Celsius for critical (in addition to device's setting)
+  --tempwarn <integer>    Degrees Celsius for warning  (using: {$cmdargs['tempwarn']})
+  --tempcrit <integer>    Degrees Celsius for critical (using: {$cmdargs['tempwarn']})
   --skip-fans             Skip fan checks
 
   --skip-psu              Skip PSU(s) checks
@@ -657,23 +593,14 @@ Options:
 
   --skip-reboot           Skip reboot check
   --lastcheck             Nagios $LASTSERVICECHECK$ macro. Used by reboot check such that if the
-                          last reboot was within the last check, then an alert if generated. Overrides
+                          last reboot was within the last check, then an alert is generated. Overrides
                           --reboot to ensure reboots are caught
-
-  --skip-others           Skip 'other' checks
+  --reboot <integer>      How many seconds ago should we warn that the device has been rebooted (using: {$cmdargs['reboot']})
 
   --skip-cpu              Skip all CPU utilisation checks
-  --skip-cpu-1sec         Skip 1sec CPU utilisation check
-  --skip-cpu-5sec         Skip 5sec CPU utilisation check
-  --skip-cpu-1min         Skip 1min CPU utilisation check
-  --thres-cpu-1sec        CPU warning,critical thresholds for 1sec checks (using 95,98)
-  --thres-cpu-5sec        CPU warning,critical thresholds for 5sec checks (using 85,95)
-  --thres-cpu-1min        CPU warning,critical thresholds for 1min checks (using 70,90)
-
-  --reboot <integer>      How many minutes ago should we warn that the device has been rebooted (using: 60)
+  --thres-cpu             CPU warning,critical thresholds for 5sec checks (using {$cmdargs['thres-cpu']})
 
 
 END_USAGE;
 
 }
-
